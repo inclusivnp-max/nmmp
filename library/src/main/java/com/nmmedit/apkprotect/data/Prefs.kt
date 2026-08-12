@@ -47,7 +47,7 @@ object Prefs : PreferencesManager(binDir, "nmmp_preferences.json") {
 
     @JvmStatic
     fun getVmName(): String {
-        return getString("vm_name", "nmmvm")
+        return getString("vm_name", "wexprotectcore")
     }
 
     @JvmStatic
@@ -57,7 +57,7 @@ object Prefs : PreferencesManager(binDir, "nmmp_preferences.json") {
 
     @JvmStatic
     fun getNmmpName(): String {
-        return getString("nmmp_name", "nmmp")
+        return getString("nmmp_name", "wexprotect")
     }
 
     @JvmStatic
@@ -79,7 +79,7 @@ object Prefs : PreferencesManager(binDir, "nmmp_preferences.json") {
     fun getRegisterNativesClassName(): String {
         return getString(
             "register_natives_class_name",
-            "com/nmmedit/protect/NativeUtil"
+            "com/wex/protect/WexProtect"
         )
     }
 
