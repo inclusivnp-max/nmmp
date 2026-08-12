@@ -44,6 +44,7 @@ public class CmakeUtils {
         try (FileWriter fileWriter = new FileWriter(source)) {
             fileWriter.write(headerContent);
         }
+        System.out.println("   [1] opcode randomizer     opcode map + handler table regenerated");
     }
 
     //读取证书信息,并把公钥写入签名验证文件里,运行时对apk进行签名校验
@@ -83,6 +84,7 @@ public class CmakeUtils {
         lines = lines.replaceAll("-fvisibility=hidden", "-fvisibility=hidden " + cxxFlags);
 
         FileHelper.writeToFile(cmakeTemp, lines);
+        System.out.println("   [6] branding              lib" + libNmmpName + " / lib" + libVmName);
     }
 
 
@@ -100,6 +102,8 @@ public class CmakeUtils {
             }
         }
         final List<File> cSources = ApkUtils.extractFiles(vmsrcFile, ".*", srcDir);
+
+        System.out.println("[WexProtect] baking hardening into VM sources:");
 
         //处理指令及apk验证,生成新的c文件
         for (File source : cSources) {
@@ -132,6 +136,8 @@ public class CmakeUtils {
                 "0xCAFEF00Du /*SIGFOLD*/",
                 String.format("0x%08xu /*SIGFOLD*/", fold & 0xffffffffL));
         FileHelper.writeToFile(source, replaced);
+        System.out.println(String.format("   [4] signature binding     fold=0x%08x%s",
+                fold & 0xffffffffL, fold == 0 ? " (disabled)" : " baked into VM"));
     }
 
     //每构建唯一的种子: 绑定到opcode置换种子, 保证可复现
@@ -153,6 +159,7 @@ public class CmakeUtils {
         lines = lines.replace("0xA5A5A5A5u /*WXMA*/", String.format("0x%08xu /*WXMA*/", a));
         lines = lines.replace("0x5A5A5A5Bu /*WXMB*/", String.format("0x%08xu /*WXMB*/", b));
         FileHelper.writeToFile(source, lines);
+        System.out.println(String.format("   [5] handler mutation      constants A=0x%08x B=0x%08x (per-build)", a, b));
     }
 
     private static void writeRandomResolver(File source) throws IOException {
