@@ -11,11 +11,13 @@ import com.android.tools.smali.dexlib2.util.MethodUtil;
 import com.google.common.collect.HashMultimap;
 import com.nmmedit.apkprotect.dex2c.DexConfig;
 import com.nmmedit.apkprotect.dex2c.converter.instructionrewriter.InstructionRewriter;
+import com.nmmedit.apkprotect.dex2c.converter.instructionrewriter.RandomInstructionRewriter;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 
 import java.io.IOException;
 import java.io.Writer;
+import java.security.SecureRandom;
 import java.util.*;
 
 
@@ -36,6 +38,11 @@ public class JniCodeGenerator {
     private final InstructionRewriter instructionRewriter;
     private final DexBackedDexFile dexFile;
 
+    // Per-method bytecode encryption keys. Seeded from the opcode-permutation
+    // build seed when available, so a protect run stays reproducible; otherwise
+    // a fresh SecureRandom. vm_decode_insns re-derives each keystream at runtime.
+    private final Random keyRandom;
+
     public JniCodeGenerator(@NotNull DexBackedDexFile dexFile,
                             @NotNull ClassAnalyzer analyzer,
                             @NotNull InstructionRewriter instructionRewriter) {
@@ -45,6 +52,12 @@ public class JniCodeGenerator {
         resolverCodeGenerator = new ResolverCodeGenerator(dexFile, analyzer);
 
         this.instructionRewriter = instructionRewriter;
+
+        if (instructionRewriter instanceof RandomInstructionRewriter) {
+            this.keyRandom = new Random(((RandomInstructionRewriter) instructionRewriter).getSeed() ^ 0xD1CE5EEDL);
+        } else {
+            this.keyRandom = new SecureRandom();
+        }
 
         instructionRewriter.loadReferences(resolverCodeGenerator.getReferences(), analyzer);
 
@@ -176,20 +189,37 @@ public class JniCodeGenerator {
         writer.append("\n");
 //        -----------结束----------------
 
-        writer.append("    static const u2 insns[] = {");
-
         final byte[] instructionData = instructionRewriter.rewriteInstructions(implementation);
         final int dataLength = instructionData.length;
-        //生成字节码数组
+        final int insnWords = dataLength / 2;
+        //生成字节码数组(加密), 运行时由 vm_decode_insns 解密到临时缓冲, 明文不落 .rodata
         final DexBuffer instructionBuf = new DexBuffer(instructionData);
+
+        //每个方法独立的 keystream 种子 (LCG), 与 c 端 vm_decode_insns 完全一致
+        final int methodKey = keyRandom.nextInt();
+        int ksState = methodKey;
+
+        writer.append("    static const u2 insns_enc[] = {");
         for (int offset = 0; offset < dataLength; offset += 2) {
             if (offset % 20 == 0) {
                 writer.append("\n");
             }
-            writer.append(String.format("0x%04x, ", instructionBuf.readUshort(offset)));
+            final int word = instructionBuf.readUshort(offset);
+            ksState = ksState * 1664525 + 1013904223;
+            final int ks = (ksState >>> 16) & 0xFFFF;
+            final int enc = (word ^ ks) & 0xFFFF;
+            writer.append(String.format("0x%04x, ", enc));
         }
-
         writer.append("\n    };\n");
+
+        //运行时解密缓冲: 小方法用栈, 大方法用堆
+        final boolean insnsUseStack = insnWords <= 2048;
+        if (insnsUseStack) {
+            writer.append(String.format("    u2 insns[%d];\n", insnWords));
+        } else {
+            writer.append(String.format("    u2 *insns = (u2 *) malloc(%d * sizeof(u2));\n", insnWords));
+        }
+        writer.append(String.format("    vm_decode_insns(insns, insns_enc, %d, 0x%08xu);\n", insnWords, methodKey));
 
 
         final byte[] tries = instructionRewriter.handleTries(implementation);
@@ -228,6 +258,10 @@ public class JniCodeGenerator {
         //不使用栈需要释放内存
         if (!useStack) {
             writer.write("    free(regs);\n");
+        }
+        //解密缓冲若在堆上分配也需要释放
+        if (!insnsUseStack) {
+            writer.write("    free(insns);\n");
         }
 
         //根据返回类型处理jvalue
