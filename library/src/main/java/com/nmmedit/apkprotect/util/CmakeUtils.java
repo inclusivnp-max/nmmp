@@ -2,6 +2,7 @@ package com.nmmedit.apkprotect.util;
 
 import com.nmmedit.apkprotect.data.Prefs;
 import com.nmmedit.apkprotect.dex2c.converter.instructionrewriter.InstructionRewriter;
+import com.nmmedit.apkprotect.dex2c.converter.instructionrewriter.RandomInstructionRewriter;
 import com.nmmedit.apkprotect.sign.ApkVerifyCodeGenerator;
 import org.jetbrains.annotations.NotNull;
 
@@ -115,6 +116,9 @@ public class CmakeUtils {
             } else if (source.getName().equals("SigCheck.cpp")) {
                 //把签名指纹烧进VM,使字节码解密绑定到原始签名
                 writeSigFold(source, Prefs.getExpectedSigFold());
+            } else if (source.getName().equals("InterpC-portable.cpp")) {
+                //每次构建注入不同的handler变异常量, 破坏开源handler的字节指纹
+                mutateHandlers(source, mutationSeed(instructionRewriter));
             }
         }
     }
@@ -128,6 +132,27 @@ public class CmakeUtils {
                 "0xCAFEF00Du /*SIGFOLD*/",
                 String.format("0x%08xu /*SIGFOLD*/", fold & 0xffffffffL));
         FileHelper.writeToFile(source, replaced);
+    }
+
+    //每构建唯一的种子: 绑定到opcode置换种子, 保证可复现
+    private static long mutationSeed(InstructionRewriter rewriter) {
+        if (rewriter instanceof RandomInstructionRewriter) {
+            return ((RandomInstructionRewriter) rewriter).getSeed() ^ 0xB16B00B5L;
+        }
+        return 0x9E3779B97F4A7C15L;
+    }
+
+    //把HANDLE_OPCODE宏里的变异常量占位符替换为本次构建的随机常量
+    private static void mutateHandlers(File source, long seed) throws IOException {
+        final BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(
+                new FileInputStream(source), StandardCharsets.UTF_8));
+        String lines = bufferedReader.lines().collect(Collectors.joining("\n"));
+        final Random rnd = new Random(seed);
+        final long a = (rnd.nextInt() | 1) & 0xffffffffL; //奇数乘子, 更好混合
+        final long b = rnd.nextInt() & 0xffffffffL;
+        lines = lines.replace("0xA5A5A5A5u /*WXMA*/", String.format("0x%08xu /*WXMA*/", a));
+        lines = lines.replace("0x5A5A5A5Bu /*WXMB*/", String.format("0x%08xu /*WXMB*/", b));
+        FileHelper.writeToFile(source, lines);
     }
 
     private static void writeRandomResolver(File source) throws IOException {
