@@ -112,8 +112,22 @@ public class CmakeUtils {
                 writeRandomResolver(source);
             } else if (source.getName().endsWith("JNIWrapper.h")) {
                 writeRandomJNIWrapper(source);
+            } else if (source.getName().equals("SigCheck.cpp")) {
+                //把签名指纹烧进VM,使字节码解密绑定到原始签名
+                writeSigFold(source, Prefs.getExpectedSigFold());
             }
         }
+    }
+
+    //替换SigCheck.cpp里的签名fold占位符, 0=禁用
+    private static void writeSigFold(File source, long fold) throws IOException {
+        final BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(
+                new FileInputStream(source), StandardCharsets.UTF_8));
+        final String lines = bufferedReader.lines().collect(Collectors.joining("\n"));
+        final String replaced = lines.replace(
+                "0xCAFEF00Du /*SIGFOLD*/",
+                String.format("0x%08xu /*SIGFOLD*/", fold & 0xffffffffL));
+        FileHelper.writeToFile(source, replaced);
     }
 
     private static void writeRandomResolver(File source) throws IOException {

@@ -139,4 +139,16 @@ object Prefs : PreferencesManager(binDir, "nmmp_preferences.json") {
     fun getNdkStrip(): String {
         return getString("strip", "/bin/llvm-strip")
     }
+
+    // 32-bit fold of the signing cert DER, baked into the VM so bytecode
+    // decryption is bound to the original signature. 0 == disabled.
+    @JvmStatic
+    fun getExpectedSigFold(): Long {
+        return getString("expected_sig_fold", "0").toLongOrNull() ?: 0L
+    }
+
+    @JvmStatic
+    fun setExpectedSigFold(value: Long) {
+        putString("expected_sig_fold", value.toString())
+    }
 }
