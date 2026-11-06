@@ -8,6 +8,7 @@ import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction11x
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction35c;
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction3rc;
 import com.android.tools.smali.dexlib2.iface.ClassDef;
+import com.android.tools.smali.dexlib2.iface.Annotation;
 import com.android.tools.smali.dexlib2.iface.Method;
 import com.android.tools.smali.dexlib2.iface.MethodImplementation;
 import com.android.tools.smali.dexlib2.iface.MethodParameter;
@@ -23,19 +24,23 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 public class MethodConverter {
 
     @NotNull
     private final ClassAnalyzer classAnalyzer;
+    private final String flowLockAnnotationType;
 
-    public MethodConverter(@NotNull ClassAnalyzer classAnalyzer) {
+    public MethodConverter(@NotNull ClassAnalyzer classAnalyzer, String flowLockAnnotationType) {
         this.classAnalyzer = classAnalyzer;
+        this.flowLockAnnotationType = flowLockAnnotationType;
     }
 
     //方法转换为native方法
     @Contract("_ -> new")
-    private static @NotNull Method methodToNative(final @NotNull Method method) {
+    private @NotNull Method methodToNative(final @NotNull Method method) {
         return new ImmutableMethod(
                 method.getDefiningClass(),
                 method.getName(),
@@ -44,9 +49,18 @@ public class MethodConverter {
                 method.getReturnType(),
                 //添加native标识
                 method.getAccessFlags() | AccessFlags.NATIVE.getValue(),
-                method.getAnnotations(),
+                shellAnnotations(method),
                 method.getHiddenApiRestrictions(),
                 null);
+    }
+
+    private @NotNull Set<? extends Annotation> shellAnnotations(@NotNull Method method) {
+        if (flowLockAnnotationType == null) {
+            return method.getAnnotations();
+        }
+        return method.getAnnotations().stream()
+                .filter(annotation -> !flowLockAnnotationType.equals(annotation.getType()))
+                .collect(Collectors.toSet());
     }
 
     @Contract(pure = true)
@@ -214,7 +228,7 @@ public class MethodConverter {
                 method.getReturnType(),
                 //私有的native方法
                 accessFlags | AccessFlags.NATIVE.getValue(),
-                method.getAnnotations(),
+                shellAnnotations(method),
                 method.getHiddenApiRestrictions(),
                 null);
 
@@ -239,7 +253,7 @@ public class MethodConverter {
                 method.getParameters(),
                 method.getReturnType(),
                 method.getAccessFlags(),
-                method.getAnnotations(),
+                shellAnnotations(method),
                 method.getHiddenApiRestrictions(),
                 methodImpl);
 

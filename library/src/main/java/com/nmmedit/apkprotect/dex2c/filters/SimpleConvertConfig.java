@@ -30,4 +30,9 @@ public class SimpleConvertConfig implements ClassAndMethodFilter {
         }
         return simpleRule != null && simpleRule.matchMethod(method.getName());
     }
+
+    @Override
+    public String getFlowLockAnnotationType() {
+        return simpleRule == null ? null : simpleRule.getFlowLockAnnotationType();
+    }
 }

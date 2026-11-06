@@ -2,7 +2,9 @@ package com.nmmedit.apkprotect;
 
 import com.nmmedit.apkprotect.data.Prefs;
 import com.nmmedit.apkprotect.log.VmpLogger;
+import com.nmmedit.apkprotect.util.ElfAntiObjdumpPatcher;
 import com.nmmedit.apkprotect.util.FileHelper;
+import com.nmmedit.apkprotect.util.ElfIntegrityPatcher;
 import org.jetbrains.annotations.NotNull;
 
 import java.io.*;
@@ -22,7 +24,10 @@ public class BuildNativeLib {
 
         final Map<String, Map<File, File>> allLibs = new HashMap<>();
 
-        for (String abi : abis) {
+        for (int i = 0; i < abis.size(); i++) {
+            String abi = abis.get(i);
+            int percent = 60 + (int) (((i + 1) / (double) abis.size()) * 18.0);
+            ApkProtect.printProgress(percent, "Building native C++ VM shared libraries (" + abi + ")...");
             final BuildNativeLib.CMakeOptions cmakeOptions = new BuildNativeLib.CMakeOptions(cmakePath,
                     sdkHome,
                     ndkHome, 21,
@@ -68,6 +73,31 @@ public class BuildNativeLib {
                             entry.getKey().getAbsolutePath()
                     )
             );
+            // Both generated libraries carry an independent expected-text
+            // placeholder.  Each wrapper mixes the generated-library result
+            // into its AEAD site cookie; the VM library verifies itself too.
+            final byte[] digest = ElfIntegrityPatcher.patch(entry.getValue());
+            final StringBuilder hex = new StringBuilder();
+            for (byte b : digest) hex.append(String.format("%02x", b & 0xff));
+            if (vmpLogger != null) {
+                vmpLogger.info("Native text integrity SHA-256 ("
+                        + entry.getValue().getName() + "): " + hex);
+            } else {
+                System.out.println("Native text integrity SHA-256 ("
+                        + entry.getValue().getName() + "): " + hex);
+            }
+            final ElfAntiObjdumpPatcher.Result hardening =
+                    ElfAntiObjdumpPatcher.patch(entry.getValue());
+            final String hardeningMessage = String.format(
+                    "ELF anti-objdump: %s, sections preserved %d, executable flags cleared %d",
+                    entry.getValue().getName(),
+                    hardening.originalSectionCount(),
+                    hardening.modifiedSectionCount());
+            if (vmpLogger != null) {
+                vmpLogger.info(hardeningMessage);
+            } else {
+                System.out.println(hardeningMessage);
+            }
         }
 
         //编译成功的so
@@ -93,13 +123,13 @@ public class BuildNativeLib {
             final int exitStatus = process.waitFor();
             if (exitStatus != 0) {
                 if (logger != null) {
-                    logger.error(String.format("Cmd '%s' exec failed", cmds.toString()));
-                } else {
-                    throw new IOException(String.format("Cmd '%s' exec failed", cmds.toString()));
+                    logger.error(String.format("Cmd '%s' exec failed with exit status %d", cmds.toString(), exitStatus));
                 }
+                throw new IOException(String.format("Cmd '%s' exec failed with exit status %d", cmds.toString(), exitStatus));
             }
         } catch (InterruptedException e) {
             e.printStackTrace();
+            throw new IOException("Command execution interrupted", e);
         }
     }
 
@@ -244,10 +274,9 @@ public class BuildNativeLib {
             final VmpLogger logger = vmpLogger;
             if (!vmFile.exists()) {
                 if (logger != null) {
-                    logger.warning("Not Found so: " + vmFile.getAbsolutePath());
-                } else {
-                    throw new RuntimeException("Not Found so: " + vmFile.getAbsolutePath());
+                    logger.error("Not Found so: " + vmFile.getAbsolutePath());
                 }
+                throw new RuntimeException("Not Found so: " + vmFile.getAbsolutePath());
             }
 
             map.put(vmFile, new File(stripOutputDir, vm));
@@ -260,10 +289,9 @@ public class BuildNativeLib {
             }
             if (!vmpFile.exists()) {
                 if (logger != null) {
-                    logger.warning("Not Found so: " + vmpFile.getAbsolutePath());
-                } else {
-                    throw new RuntimeException("Not Found so: " + vmpFile.getAbsolutePath());
+                    logger.error("Not Found so: " + vmpFile.getAbsolutePath());
                 }
+                throw new RuntimeException("Not Found so: " + vmpFile.getAbsolutePath());
             }
             map.put(vmpFile, new File(stripOutputDir, vmp));
 

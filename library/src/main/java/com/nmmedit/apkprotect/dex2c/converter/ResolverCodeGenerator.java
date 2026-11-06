@@ -7,12 +7,15 @@ import com.android.tools.smali.dexlib2.util.MethodUtil;
 import com.nmmedit.apkprotect.util.ModifiedUtf8;
 import org.jetbrains.annotations.NotNull;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.UTFDataFormatException;
 import java.io.Writer;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
-import java.util.UUID;
 
 /**
  * 根据dex生成符号解析代码,比如字符串常量池,类型常量池这些
@@ -20,12 +23,14 @@ import java.util.UUID;
 
 public class ResolverCodeGenerator {
     private final References references;
+    private final VmKeyConfig vmKeyConfig;
 
     public ResolverCodeGenerator(DexBackedDexFile dexFile,
-                                 @NotNull ClassAnalyzer analyzer
+                                 @NotNull ClassAnalyzer analyzer,
+                                 @NotNull VmKeyConfig vmKeyConfig
     ) {
-
         references = new References(dexFile, analyzer);
+        this.vmKeyConfig = vmKeyConfig;
     }
 
     static @NotNull String stringEsc(String str) throws UTFDataFormatException {
@@ -46,9 +51,7 @@ public class ResolverCodeGenerator {
         writer.write("#include \"ConstantPool.h\"\n\n");
         writer.write("#include <pthread.h>\n\n\n");
 
-        byte[] keys = generateStringKeys();
-
-        generateStringPool(writer, keys);
+        final PoolCipher stringPool = generateStringPool(writer);
         generateTypePool(writer);
 
         //额外添加的,方便生成结构体
@@ -62,11 +65,7 @@ public class ResolverCodeGenerator {
         generateStringConstants(writer);
 
         //生成初始化函数及符号解析器结构体
-        generateResolver(writer, keys);
-    }
-
-    private byte[] generateStringKeys() throws UTFDataFormatException {
-        return ModifiedUtf8.encode(UUID.randomUUID().toString());
+        generateResolver(writer, stringPool);
     }
 
     //产生const-string*指令对应的缓存
@@ -97,13 +96,8 @@ public class ResolverCodeGenerator {
         writer.write(String.format("static jstring gStringConstants[%d];\n\n", constStringIds.length));
     }
 
-    private void generateResolver(@NotNull Writer writer, byte[] keys) throws IOException {
-        StringBuilder stringBuilder = new StringBuilder();
-        for (byte k : keys) {
-            stringBuilder.append(String.format("0x%02x,", k & 0xFF));
-        }
-        String generatedKey = stringBuilder.toString();
-
+    private void generateResolver(@NotNull Writer writer,
+                                  @NotNull PoolCipher stringPool) throws IOException {
         writer.write("static void resolver_init(JNIEnv *env) {\n" +
                 "    if(sizeof(gFields) == 0) return;\n" +
                 "    if(sizeof(gMethods) == 0) return;\n" +
@@ -113,22 +107,21 @@ public class ResolverCodeGenerator {
                 "    memset(gStringConstants, 0, sizeof(gStringConstants));\n" +
                 "}\n" +
                 "\n" +
-                "static int gDecrypted = 0;\n" +
+                "static pthread_once_t gStringDecryptOnce = PTHREAD_ONCE_INIT;\n" +
+                "static bool gStringPoolValid = false;\n" +
+                "\n" +
+                "static void decrypt_string_pool(void) {\n" +
+                String.format(
+                        "    const u8 integrity = nmmp_integrity_delta();\n" +
+                        "    gStringPoolValid = vm_aead_open(gBaseStrPtr, gBaseStrPtr, sizeof(gBaseStrPtr), " +
+                        "gStringPoolNonce, gStringPoolTag, 0x%08xu, 0x%016xULL, " +
+                        "0x%016xULL ^ integrity);\n",
+                        VmAead.DOMAIN_RESOLVER, stringPool.contextTag, stringPool.siteMaterial) +
+                "}\n" +
                 "\n" +
                 "static const char* STRING_BY_ID(int _idx) {\n" +
-                "    if (!gDecrypted) {\n" +
-                "        gDecrypted = 1;\n" +
-                "\n" +
-                "        u1 keys[] = {" + generatedKey + "};\n" +
-                "        int size_of_keys = sizeof(keys);\n" +
-                "\n" +
-                "        int i = 0;\n" +
-                "        int key_index = 0;\n" +
-                "        for (i = 0; i < sizeof(gBaseStrPtr); i++, key_index++) {\n" +
-                "            gBaseStrPtr[i] ^= keys[key_index % size_of_keys];\n" +
-                "        }\n" +
-                "    }\n" +
-                "\n" +
+                "    pthread_once(&gStringDecryptOnce, decrypt_string_pool);\n" +
+                "    if (!gStringPoolValid) return \"\";\n" +
                 "    return ((const char *) (gBaseStrPtr + gStringIds[_idx].off)); \n" +
                 "}\n" +
                 //"#define STRING_BY_ID(_idx) ((const char *) (gBaseStrPtr + gStringIds[_idx].off))\n" +
@@ -400,32 +393,47 @@ public class ResolverCodeGenerator {
         writer.write(String.format("static vmField gFields[%d];\n", fieldPool.size()));
     }
 
-    private void generateStringPool(@NotNull Writer writer, byte[] keys) throws IOException {
-        writer.write("static u1 gBaseStrPtr[]={\n");
+    private @NotNull PoolCipher generateStringPool(@NotNull Writer writer) throws IOException {
+        final ArrayList<Long> strOffsets = new ArrayList<>();
+        final ByteArrayOutputStream plainPool = new ByteArrayOutputStream();
+        final MessageDigest identityDigest;
+        try {
+            identityDigest = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new AssertionError(e);
+        }
 
-        ArrayList<Long> strOffsets = new ArrayList<>();
-        long strOffset = 0;
-
-        long keyIndex = 0;
-
-        final List<String> stringPool = references.getStringPool();
-        for (String string : stringPool) {
-
+        for (String string : references.getStringPool()) {
+            strOffsets.add((long) plainPool.size());
             //必须使用modified utf8，不然jni的NewStringUtf函数可能出问题.issue #3
-            byte[] bytes = ModifiedUtf8.encode(string);
+            final byte[] bytes = ModifiedUtf8.encode(string);
+            plainPool.write(bytes);
+            plainPool.write(0);
+            identityDigest.update(bytes);
+            identityDigest.update((byte) 0);
+        }
 
-            writer.write("    ");
-            for (byte aByte : bytes) {
-                writer.write(String.format("0x%02x,", (aByte ^ keys[(int)(keyIndex % keys.length)]) & 0xFF));
-                ++keyIndex;
-            }
-            writer.write(String.format("0x%02x,\n", (keys[(int) (keyIndex % keys.length)]) & 0xFF));
-            ++keyIndex;
+        final byte[] plain = plainPool.toByteArray();
+        final StringBuilder identity = new StringBuilder("resolver:");
+        for (byte b : identityDigest.digest()) identity.append(String.format("%02x", b & 0xff));
+        final String poolIdentity = identity.toString();
+        final long contextTag = vmKeyConfig.methodTag64(poolIdentity);
+        final long siteMaterial = vmKeyConfig.siteCookie(poolIdentity);
+        final VmAead.Sealed sealed = VmAead.seal(vmKeyConfig, plain,
+                VmAead.DOMAIN_RESOLVER, contextTag,
+                vmKeyConfig.nonce("resolver-pool", poolIdentity), siteMaterial);
+        final byte[] encryptedPool = sealed.ciphertext();
+        Arrays.fill(plain, (byte) 0);
 
-            strOffsets.add(strOffset);
-            strOffset += bytes.length + 1;
+        writer.write("static u1 gBaseStrPtr[]={\n");
+        for (int i = 0; i < encryptedPool.length; i++) {
+            if (i % 16 == 0) writer.write("    ");
+            writer.write(String.format("0x%02x,", encryptedPool[i] & 0xff));
+            if (i % 16 == 15 || i == encryptedPool.length - 1) writer.write("\n");
         }
         writer.write("};\n\n");
+        writeByteArray(writer, "gStringPoolNonce", sealed.nonce());
+        writeByteArray(writer, "gStringPoolTag", sealed.tag());
 
         writer.write(
                 "\n" +
@@ -444,6 +452,28 @@ public class ResolverCodeGenerator {
         writer.write("//ends string ids\n\n");
 
         writer.flush();
+        return new PoolCipher(contextTag, siteMaterial);
+    }
+
+    private static void writeByteArray(@NotNull Writer writer,
+                                       @NotNull String name,
+                                       byte @NotNull [] data) throws IOException {
+        writer.write("static const u1 " + name + "[" + data.length + "] = {");
+        for (int i = 0; i < data.length; i++) {
+            if ((i & 15) == 0) writer.write("\n    ");
+            writer.write(String.format("0x%02x, ", data[i] & 0xff));
+        }
+        writer.write("\n};\n\n");
+    }
+
+    private static final class PoolCipher {
+        private final long contextTag;
+        private final long siteMaterial;
+
+        private PoolCipher(long contextTag, long siteMaterial) {
+            this.contextTag = contextTag;
+            this.siteMaterial = siteMaterial;
+        }
     }
 
     private void generateTypePool(@NotNull Writer writer) throws IOException {

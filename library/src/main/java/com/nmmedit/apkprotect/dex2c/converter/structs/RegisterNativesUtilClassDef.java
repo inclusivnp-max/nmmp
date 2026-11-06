@@ -134,7 +134,11 @@ public class RegisterNativesUtilClassDef extends BaseTypeReference implements Cl
         @NotNull
         @Override
         public @Unmodifiable List<? extends MethodParameter> getParameters() {
-            return Collections.emptyList();
+            // DexPool serializes a method prototype from Method#getParameters(), not from
+            // MethodReference#getParameterTypes().  Returning an empty list here therefore
+            // wrote classes*Init0()V while injected call sites correctly referenced
+            // classes*Init0(I)V, causing ART to fail class linking with NoSuchMethodError.
+            return Collections.singletonList(new EmptyAnnotationMethodParameter("I"));
         }
 
         @Override

@@ -1,0 +1,172 @@
+flowlock-annotation client.wex.annotations.WexFlowLock
+class client.wex.** { *; }
+class gov.** { *; }
+
+# TDLib JNI: TdApi.<clinit> calls System.loadLibrary("tdjni") and libtdjni
+# FindClass's every TdApi$* from JNI_OnLoad. dex2c/wexbridge on that path
+# re-enters the .so and native-aborts (pool-*-thread / TdApi.<clinit>).
+keep class client.wex.modules.TdJniLoader
+keep class client.wex.modules.WexKernelJni
+keep class client.wex.modules.KernelLineSink
+keep class client.wex.modules.NativeModuleGate
+keep class client.wex.modules.NativeModuleStore
+keep class client.wex.modules.NativeModuleInstaller
+keep class client.wex.utils.helper.tgkiller.**
+keep class gov.secnet.services.Telegram*
+keep class gov.secnet.services.Trolling*
+
+# GuardConfig: AES-GCM crypto + FileInputStream/BufferedReader on a hot path.
+# Every access-token read (auth gate, WAI, VPN, Menu, dozens more) goes through
+# it. Under dex2c/vmp static ciphers + IO in the same frame are the #1 source
+# of "worked in debug, dies in release" failures — keep the whole family raw.
+keep class gov.secnet.guard.**
+# Keep only the stateful/Android-facing security coordinators in DEX.
+# Auth2FA, FeatureEntitlements and GeneratedFieldCodec carry @WexFlowLock and
+# must remain selected so their protected methods reach the native VM.
+keep class gov.secnet.security.Guard
+keep class gov.secnet.security.Guard$*
+keep class gov.secnet.security.Initialize
+keep class gov.secnet.security.Initialize$*
+keep class gov.secnet.security.callback.**
+
+# AI Chat runtime is a Kotlin object singleton (statics: app, store, client).
+# Virtualized `putstatic`/`getstatic` in nmmp doesn't always survive class
+# re-init, so hasSession()/ensure() race'd against each other in native VM.
+# Keep the whole subsystem raw — okhttp streaming inside AiChatClient also
+# doesn't like being interpreted.
+keep class client.wex.feature.fun.**
+
+# LuaSandbox.TimeoutDebugLib.onInstruction() is called by LuaJ on EVERY Lua opcode — thousands
+# of times per second during plugin execution. Virtualizing it routes each call through the nmmp
+# VM, tanking performance. Keep only the sandbox and the LibFunction bridges that LuaJ calls back
+# into; the rest of the plugins package (UI, repository, installer, manifest) can be virtualized.
+keep class client.wex.plugins.LuaSandbox
+keep class client.wex.plugins.LuaSandbox$*
+keep class client.wex.plugins.WexBridge
+keep class client.wex.plugins.WexBridge$*
+keep class client.wex.plugins.HeadlessWex
+keep class client.wex.plugins.HeadlessWex$*
+keep class client.wex.plugins.PluginUi
+keep class client.wex.plugins.PluginUi$*
+keep class client.wex.plugins.LuaJson
+keep class client.wex.plugins.LuaJson$*
+keep class client.wex.plugins.SecureStore
+keep class client.wex.plugins.SecureStore$*
+
+# BEGIN WEX MARKETPLACE VMP CAST FIX
+# buildCategoryChips/loadCategories use Kotlin generic collections and Material
+# view receivers; dex2c currently produces a native ClassCastException here.
+keep class client.wex.feature.general.market.MarketplaceActivity
+keep class client.wex.feature.general.market.MarketplaceActivity$*
+# END WEX MARKETPLACE VMP CAST FIX
+
+# BEGIN WEX MINECRAFT BOT ASYNC VMP FIX
+# MCProtocolLib enters these Kotlin coroutine/session callbacks from Netty event
+# loops. Keep the coordinator and generated inner callback classes in DEX: the
+# current dex2c bridge can leave invokeSuspend/connect callbacks waiting forever.
+keep class client.wex.feature.hacks.MinecraftBotActivity
+keep class client.wex.feature.hacks.MinecraftBotActivity\$*
+# END WEX MINECRAFT BOT ASYNC VMP FIX
+
+# BEGIN WEX PLUGIN EDITOR DEX CALLBACKS
+# Keep the editor UI and its generated callbacks in DEX. CodeEditor is an
+# XML-inflated AppCompatEditText: drawing, selection and TextWatcher callbacks
+# are entered by Android while the activity loads and updates the buffer.
+# This is a targeted compatibility workaround, not a change to the VM.
+# Repository, package installation and the rest of the plugin subsystem remain
+# subject to the existing rules. Include R8-mapped nested/synthetic classes.
+keep class client.wex.plugins.PluginEditorActivity
+keep class client.wex.plugins.PluginEditorActivity$*
+keep class client.wex.plugins.ide.CodeEditor
+keep class client.wex.plugins.ide.CodeEditor$*
+# END WEX PLUGIN EDITOR DEX CALLBACKS
+
+# BEGIN WEX CHAT IME AND ANIMATED BACKGROUND HOTPATHS
+# The global animated background and GeneralChatActivity IME/layout callbacks
+# both run on the UI frame path. Keep these families and R8-mapped callbacks
+# in DEX together. Animation stays enabled; adapters, transport, API and other
+# forum screens retain the original protection selection.
+keep class client.wex.utils.helper.design.AnimatedShaderBackgroundView
+keep class client.wex.utils.helper.design.AnimatedShaderBackgroundView$*
+keep class client.wex.feature.general.forum.GeneralChatActivity
+keep class client.wex.feature.general.forum.GeneralChatActivity$*
+# RecyclerView hot path: onBindViewHolder + every bind*/viewholder runs per
+# visible bubble on every scroll; ItemAnimator.animateAdd runs per new message.
+# Virtualized in the nmmp VM these interpret on the UI frame path -> chat lags.
+# Keep the adapter, media/sticker/avatar renderers and the item animator raw;
+# transport, API, caches and other forum screens stay virtualized.
+keep class client.wex.feature.general.forum.ChatMessageAdapter
+keep class client.wex.feature.general.forum.ChatMessageAdapter$*
+keep class client.wex.feature.general.forum.ChatItemAnimator
+keep class client.wex.feature.general.forum.ChatItemAnimator$*
+keep class client.wex.feature.general.forum.ForumMediaRender
+keep class client.wex.feature.general.forum.ForumMediaRender$*
+keep class client.wex.feature.general.forum.ForumStickerRenderer
+keep class client.wex.feature.general.forum.ForumStickerRenderer$*
+keep class client.wex.feature.general.forum.LetterAvatar
+keep class client.wex.feature.general.forum.LetterAvatar$*
+keep class client.wex.feature.general.forum.media.ForumVideoPoster
+keep class client.wex.feature.general.forum.media.ForumVideoPoster$*
+# Custom Views whose draw()/onMeasure()/onLayout() Android calls on EVERY layout
+# pass -> every frame of the IME open/close animation (x each visible avatar),
+# every scroll frame, every bind. AvatarShapeImageView.draw() clips a Path and
+# strokes it per repaint; virtualized in the nmmp VM that interprets dozens of
+# times per frame and is the main cause of the keyboard-raise/scroll jank.
+# BrainrootBadge.bind() runs per row bind on the same scroll path. Keep raw.
+keep class client.wex.ui.AvatarShapeImageView
+keep class client.wex.ui.AvatarShapeImageView$*
+keep class client.wex.ui.AvatarShape
+keep class client.wex.ui.AvatarShape$*
+keep class client.wex.feature.functions.brainroots.BrainrootBadge
+keep class client.wex.feature.functions.brainroots.BrainrootBadge$*
+# ROOT CAUSE of the chat scroll/keyboard jank: the chat DATA models are
+# virtualized (ChatMessage 56/60 methods -> nmmp VM), while the adapter/render
+# code is raw. Every onBindViewHolder + DiffUtil pass reads dozens of getters
+# per message (getBody/getAuthorName/getCreatedAt/getReactions/...), and each
+# one is a native nmmp-VM stub -> a JNI crossing. On scroll that is hundreds of
+# raw->VM crossings per frame; raising the keyboard scrolls to bottom and the
+# diff re-reads every message. These are plain JSON DTOs (no secrets) -> keep
+# raw so field access stays in-process. This is the fix; the UI-class keeps
+# above were already raw and were not the cause.
+keep class client.wex.data.network.WexApiClient$ChatMessage
+keep class client.wex.data.network.WexApiClient$ChatRoom
+keep class client.wex.data.network.WexApiClient$Reaction
+keep class client.wex.data.network.WexApiClient$MediaAttachment
+keep class client.wex.data.network.WexApiClient$ChatReader
+keep class client.wex.data.network.WexApiClient$TypingUser
+# THE ACTUAL FIX for chat/keyboard jank. Generated ViewBinding classes were
+# virtualized (ItemChatMessageInBinding etc. 4/7 methods -> nmmp VM). inflate()
+# and bind() run findViewById for every view in a bubble; virtualized, each
+# onCreateViewHolder during a scroll/keyboard-driven scrollToBottom spends ~30ms
+# in the VM (measured: layout phase 31.9ms, measure 0.12ms). app-release (raw
+# binding) does the same inflate in <1ms. ViewBinding is generated findViewById
+# boilerplate with nothing to protect and sits on every UI hot path -> keep raw.
+keep class client.wex.databinding.**
+# === DIAG3: keep whole forum package (localize) ===
+keep class client.wex.feature.general.forum.**
+# END WEX CHAT IME AND ANIMATED BACKGROUND HOTPATHS
+
+# BEGIN WEX BRAINROOTS + SHARED CREATURE RENDER HOTPATHS
+# Root cause of BOTH the residual chat scroll/freeze AND the brainroots list lag.
+# Chat rows draw each author's brainroot creature avatar via BrainrootBadge (kept,
+# raw) — but BrainrootBadge is a THIN FACADE: bind()/decorate()/rarityColor()
+# delegate all real work into CreatureRenderer, which was VIRTUALIZED (only the
+# facade was kept, lines 120-121). So ChatMessageAdapter(raw) -> BrainrootBadge(raw)
+# -> CreatureRenderer.bitmap()/drawBody()/drawFace() (VM) ran per visible row per
+# scroll frame, and CreatureRenderer$warmRunnable$1 re-ran bitmap() in the VM every
+# 16ms. Brainroots was worse: BrainRootsActivity + its adapters, the BrainRootsModels
+# DTO getters, top-level WheelLayoutManager scroll math, and the per-frame draws of
+# CreatureView/FadingTopRecyclerView/HeroAmbianceView/BrainRootsGameView/
+# BrainrootHeroDrawable/SegmentedControlView were all in the VM.
+# The '.**' glob is REQUIRED (not per-class): only it catches CreatureRenderer's
+# $warmRunnable$1/$cache$1/$Tier/$Frame, BrainrootHeroDrawable$tick$1, enum
+# $WhenMappings, the file-facade BrainRootsGameViewKt, the top-level (non-nested)
+# WheelLayoutManager, and R8 $$ExternalSyntheticLambda*. Mirrors the DIAG3 forum keep.
+keep class client.wex.feature.functions.brainroots.**
+# Chat time labels: IsoTime (virtualized Kotlin object in the unkept client.wex.utils)
+# is called per message in ChatMessageAdapter.buildRows() sort/group comparators and
+# per bind in timeLabel() -> a raw->VM crossing per message on every ~200-row rebuild
+# (each ~2s poll + keyboard scrollToBottom). Small util, no cold code.
+keep class client.wex.utils.IsoTime
+keep class client.wex.utils.IsoTime$*
+# END WEX BRAINROOTS + SHARED CREATURE RENDER HOTPATHS

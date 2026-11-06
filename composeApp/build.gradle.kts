@@ -9,7 +9,7 @@ plugins {
 
 kotlin {
     jvm("desktop") {
-        jvmToolchain(17)
+        jvmToolchain(21)
         withJava()
     }
     
@@ -35,6 +35,22 @@ kotlin {
         }
         desktopMain.dependencies {
             implementation(compose.desktop.currentOs)
+        }
+    }
+}
+
+tasks.register<JavaExec>("protectApk") {
+    group = "nmmp"
+    description = "Obfuscate and sign an APK"
+    dependsOn("compileKotlinDesktop")
+    val desktopCompilation = kotlin.jvm("desktop").compilations.getByName("main")
+    classpath = desktopCompilation.runtimeDependencyFiles + desktopCompilation.output.classesDirs
+    mainClass.set("ProtectCliKt")
+    jvmArgs("-Djdk.util.zip.disableZip64ExtraFieldValidation=true")
+    if (project.hasProperty("inputApk")) {
+        args(project.property("inputApk") as String)
+        if (project.hasProperty("outputApk")) {
+            args(project.property("outputApk") as String)
         }
     }
 }

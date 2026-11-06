@@ -31,7 +31,9 @@ import java.util.Set;
  */
 public class SimpleRules {
     private final HashMultimap<ClassRule, MethodRule> convertRules = HashMultimap.create();
+    private final List<String> keepClassRegexes = new ArrayList<>();
     private Set<MethodRule> methodRules;
+    private String flowLockAnnotationType;
 
     public SimpleRules() {
     }
@@ -43,15 +45,28 @@ public class SimpleRules {
 
     @NotNull
     private static String toRegex(@NotNull String s) {
-        final StringBuilder sb = new StringBuilder(s.length() + 3);
+        final StringBuilder sb = new StringBuilder(s.length() + 8);
         for (int i = 0; i < s.length(); i++) {
-            final char c = s.charAt(i);
-            if (c == '*') {
-                sb.append('.');
+            char c = s.charAt(i);
+            if (c == '\\' && i + 1 < s.length()) {
+                c = s.charAt(++i);
+                appendRegexLiteral(sb, c);
+                continue;
             }
-            sb.append(c);
+            if (c == '*') {
+                sb.append(".*");
+            } else {
+                appendRegexLiteral(sb, c);
+            }
         }
         return sb.toString();
+    }
+
+    private static void appendRegexLiteral(@NotNull StringBuilder sb, char c) {
+        if ("\\.[]{}()+-^$|?".indexOf(c) >= 0) {
+            sb.append('\\');
+        }
+        sb.append(c);
     }
 
     public void parse(Reader ruleReader) throws IOException {
@@ -63,11 +78,41 @@ public class SimpleRules {
             String line;
             while ((line = reader.readLine()) != null) {
                 line = line.trim();
-                if (line.isEmpty()) {//empty line
+                if (line.isEmpty() || line.startsWith("#") || line.startsWith("//")) {
                     lineNumb++;
                     continue;
                 }
-                if (line.startsWith("class")) {
+                if (line.startsWith("keep class") || line.startsWith("!class")) {
+                    if (methodParsing) {
+                        throw new RemoteException("Error rule " + lineNumb + ": " + line);
+                    }
+                    final String rest = line.startsWith("keep class")
+                            ? line.substring("keep class".length()).trim()
+                            : line.substring("!class".length()).trim();
+                    String className = rest;
+                    final int brace = rest.indexOf('{');
+                    if (brace != -1) {
+                        className = rest.substring(0, brace).trim();
+                    }
+                    if (className.isEmpty()) {
+                        throw new RemoteException("Error rule " + lineNumb + ": " + line);
+                    }
+                    keepClassRegexes.add(toRegex(classNameToType(className.split(" +")[0])));
+                    lineNumb++;
+                    continue;
+                }
+                if (line.startsWith("flowlock-annotation")) {
+                    if (methodParsing) {
+                        throw new RemoteException("Error rule " + lineNumb + ": " + line);
+                    }
+                    final String[] split = line.split(" +");
+                    if (split.length != 2 || flowLockAnnotationType != null || split[1].contains("*")) {
+                        throw new RemoteException("Error rule " + lineNumb + ": " + line);
+                    }
+                    flowLockAnnotationType = split[1].startsWith("L") && split[1].endsWith(";")
+                            ? split[1]
+                            : classNameToType(split[1]);
+                } else if (line.startsWith("class")) {
                     final String[] split = line.split(" +");
                     final int length = split.length;
                     if (length < 2) {
@@ -132,6 +177,12 @@ public class SimpleRules {
     }
 
     public boolean matchClass(@NotNull String classType, @Nullable String supperType, @NotNull List<String> ifacTypes) {
+        for (String keep : keepClassRegexes) {
+            if (classType.matches(keep)) {
+                methodRules = null;
+                return false;
+            }
+        }
         for (ClassRule rule : convertRules.keySet()) {
             final String typeRegex = toRegex(classNameToType(rule.className));
             if (classType.matches(typeRegex)) {// match classType
@@ -172,6 +223,10 @@ public class SimpleRules {
             }
         }
         return false;
+    }
+
+    public String getFlowLockAnnotationType() {
+        return flowLockAnnotationType;
     }
 
     private static class ClassRule {

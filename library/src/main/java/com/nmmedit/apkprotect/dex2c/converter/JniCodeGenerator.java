@@ -4,20 +4,19 @@ import com.android.tools.smali.dexlib2.AccessFlags;
 import com.android.tools.smali.dexlib2.dexbacked.DexBackedClassDef;
 import com.android.tools.smali.dexlib2.dexbacked.DexBackedDexFile;
 import com.android.tools.smali.dexlib2.dexbacked.DexBackedMethod;
-import com.android.tools.smali.dexlib2.dexbacked.DexBuffer;
 import com.android.tools.smali.dexlib2.iface.Method;
 import com.android.tools.smali.dexlib2.iface.MethodImplementation;
 import com.android.tools.smali.dexlib2.util.MethodUtil;
 import com.google.common.collect.HashMultimap;
+import com.nmmedit.apkprotect.data.Prefs;
 import com.nmmedit.apkprotect.dex2c.DexConfig;
+import com.nmmedit.apkprotect.dex2c.FlowLockPlanner;
 import com.nmmedit.apkprotect.dex2c.converter.instructionrewriter.InstructionRewriter;
-import com.nmmedit.apkprotect.dex2c.converter.instructionrewriter.RandomInstructionRewriter;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 
 import java.io.IOException;
 import java.io.Writer;
-import java.security.SecureRandom;
 import java.util.*;
 
 
@@ -37,27 +36,21 @@ public class JniCodeGenerator {
     private final ResolverCodeGenerator resolverCodeGenerator;
     private final InstructionRewriter instructionRewriter;
     private final DexBackedDexFile dexFile;
-
-    // Per-method bytecode encryption keys. Seeded from the opcode-permutation
-    // build seed when available, so a protect run stays reproducible; otherwise
-    // a fresh SecureRandom. vm_decode_insns re-derives each keystream at runtime.
-    private final Random keyRandom;
+    private final String flowLockAnnotationType;
+    private final VmKeyConfig vmKeyConfig;
 
     public JniCodeGenerator(@NotNull DexBackedDexFile dexFile,
                             @NotNull ClassAnalyzer analyzer,
-                            @NotNull InstructionRewriter instructionRewriter) {
+                            @NotNull InstructionRewriter instructionRewriter,
+                            String flowLockAnnotationType) {
         this.dexFile = dexFile;
+        this.vmKeyConfig = VmKeyConfig.create(instructionRewriter, Prefs.getExpectedSigFold());
 
 //      根据dex里字符串常量,类型常量等生成符号解析代码,给vm提供符号信息
-        resolverCodeGenerator = new ResolverCodeGenerator(dexFile, analyzer);
+        resolverCodeGenerator = new ResolverCodeGenerator(dexFile, analyzer, vmKeyConfig);
 
         this.instructionRewriter = instructionRewriter;
-
-        if (instructionRewriter instanceof RandomInstructionRewriter) {
-            this.keyRandom = new Random(((RandomInstructionRewriter) instructionRewriter).getSeed() ^ 0xD1CE5EEDL);
-        } else {
-            this.keyRandom = new SecureRandom();
-        }
+        this.flowLockAnnotationType = flowLockAnnotationType;
 
         instructionRewriter.loadReferences(resolverCodeGenerator.getReferences(), analyzer);
 
@@ -95,6 +88,9 @@ public class JniCodeGenerator {
         final List<? extends CharSequence> parameterTypes = method.getParameterTypes();
         final int parameterRegisterCount = MethodUtil.getParameterRegisterCount(parameterTypes, isStatic);
         final String returnType = method.getReturnType();
+        final String methodIdentity = methodIdentity(
+                classType, methodName, parameterTypes, returnType);
+        final String nativeFunctionName = vmKeyConfig.nativeSymbol(methodIdentity);
 
 
         String clazzName = classType.substring(1, classType.length() - 1);
@@ -104,7 +100,7 @@ public class JniCodeGenerator {
         writer.write(String.format("%s %s %s(JNIEnv *env, %s ",
                 isRegisterNative ? "static" : "JNIEXPORT",
                 getJNIType(returnType),
-                MyMethodUtil.getJniFunctionName(clazzName, methodName, parameterTypes, returnType),
+                nativeFunctionName,
                 isStatic ? "jclass jcls" : "jobject thiz")
         );
 
@@ -192,51 +188,104 @@ public class JniCodeGenerator {
         final byte[] instructionData = instructionRewriter.rewriteInstructions(implementation);
         final int dataLength = instructionData.length;
         final int insnWords = dataLength / 2;
-        //生成字节码数组(加密), 运行时由 vm_decode_insns 解密到临时缓冲, 明文不落 .rodata
-        final DexBuffer instructionBuf = new DexBuffer(instructionData);
-
-        //每个方法独立的 keystream 种子 (LCG), 与 c 端 vm_decode_insns 完全一致
-        final int methodKey = keyRandom.nextInt();
-        int ksState = methodKey;
-
-        writer.append("    static const u2 insns_enc[] = {");
-        for (int offset = 0; offset < dataLength; offset += 2) {
-            if (offset % 20 == 0) {
-                writer.append("\n");
+        final boolean annotated = FlowLockPlanner.isMarked(method, flowLockAnnotationType);
+        final boolean useFlow = annotated;
+        final FlowLockPlanner.Plan flowPlan = annotated
+                ? FlowLockPlanner.createPlan(method, "implementation DEX")
+                : null;
+        final long methodTag = vmKeyConfig.methodTag64(methodIdentity);
+        final long methodSite = vmKeyConfig.siteCookie(methodIdentity);
+        VmAead.Sealed instructionBlob = null;
+        final ArrayList<FlowBlob> flowBlobs = new ArrayList<>();
+        final byte[] encryptedInstructions;
+        if (useFlow) {
+            encryptedInstructions = new byte[dataLength];
+            for (int i = 0; i < flowPlan.blockCount(); i++) {
+                final int startWords = flowPlan.starts()[i];
+                final int sizeWords = flowPlan.starts()[i + 1] - startWords;
+                final int startBytes = startWords * 2;
+                final int sizeBytes = sizeWords * 2;
+                final String blockIdentity = methodIdentity + "#flow:" + i;
+                final long blockTag = vmKeyConfig.methodTag64(blockIdentity);
+                final long blockSite = vmKeyConfig.siteCookie(blockIdentity);
+                final byte[] nonce = vmKeyConfig.nonce("flow-block", blockIdentity);
+                final byte[] plainBlock = Arrays.copyOfRange(
+                        instructionData, startBytes, startBytes + sizeBytes);
+                final VmAead.Sealed sealed = VmAead.seal(vmKeyConfig, plainBlock,
+                        VmAead.DOMAIN_FLOW_BLOCK, blockTag, nonce, blockSite);
+                final byte[] ciphertext = sealed.ciphertext();
+                System.arraycopy(ciphertext, 0, encryptedInstructions, startBytes, ciphertext.length);
+                Arrays.fill(plainBlock, (byte) 0);
+                Arrays.fill(ciphertext, (byte) 0);
+                flowBlobs.add(new FlowBlob(startWords, sizeWords, blockTag, blockSite, sealed));
             }
-            final int word = instructionBuf.readUshort(offset);
-            ksState = ksState * 1664525 + 1013904223;
-            final int ks = (ksState >>> 16) & 0xFFFF;
-            final int enc = (word ^ ks) & 0xFFFF;
-            writer.append(String.format("0x%04x, ", enc));
+        } else {
+            final byte[] nonce = vmKeyConfig.nonce("instructions", methodIdentity);
+            instructionBlob = VmAead.seal(vmKeyConfig, instructionData,
+                    VmAead.DOMAIN_INSTRUCTIONS, methodTag, nonce, methodSite);
+            encryptedInstructions = instructionBlob.ciphertext();
         }
-        writer.append("\n    };\n");
 
-        //运行时解密缓冲: 小方法用栈, 大方法用堆
+        writeByteArray(writer, "insns_enc", encryptedInstructions, true);
+        if (useFlow) {
+            writer.append("    static const vmFlowBlock flow_blocks[] = {\n");
+            for (FlowBlob block : flowBlobs) {
+                writer.append(String.format(
+                        "        {%d, %d, 0x%016xULL, 0x%016xULL, %s, %s},\n",
+                        block.startWords, block.sizeWords, block.contextTag, block.siteMaterial,
+                        byteInitializer(block.sealed.nonce()),
+                        byteInitializer(block.sealed.tag())));
+            }
+            writer.append("    };\n");
+            writer.append(String.format(
+                    "    static const vmFlow flow = {insns_enc, flow_blocks, %d};\n",
+                    flowPlan.blockCount()));
+        } else {
+            writeByteArray(writer, "insns_nonce", instructionBlob.nonce(), true);
+            writeByteArray(writer, "insns_tag", instructionBlob.tag(), true);
+        }
+
         final boolean insnsUseStack = insnWords <= 2048;
         if (insnsUseStack) {
-            writer.append(String.format("    u2 insns[%d];\n", insnWords));
+            writer.append(String.format("    u2 insns[%d]%s;\n", insnWords, useFlow ? " = {0}" : ""));
+        } else if (useFlow) {
+            writer.append(String.format("    u2 *insns = (u2 *) calloc(%d, sizeof(u2));\n", insnWords));
         } else {
             writer.append(String.format("    u2 *insns = (u2 *) malloc(%d * sizeof(u2));\n", insnWords));
         }
-        writer.append(String.format("    vm_decode_insns(insns, insns_enc, %d, 0x%08xu);\n", insnWords, methodKey));
+        writer.append("    const u8 method_integrity = nmmp_integrity_delta();\n");
+        if (useFlow) {
+            writer.append("    const bool insns_ok = true;\n");
+        } else {
+            writer.append(String.format(
+                    "    const bool insns_ok = vm_aead_open((u1 *) insns, insns_enc, %d, " +
+                            "insns_nonce, insns_tag, 0x%08xu, 0x%016xULL, " +
+                            "0x%016xULL ^ method_integrity);\n",
+                    dataLength, VmAead.DOMAIN_INSTRUCTIONS, methodTag, methodSite));
+        }
 
 
         final byte[] tries = instructionRewriter.handleTries(implementation);
         StringBuilder triesBuilder = new StringBuilder();
         if (tries.length == 0) {
-            triesBuilder.append("    const u1 *tries = NULL;\n");
+            triesBuilder.append("    u1 *tries = NULL;\n");
+            triesBuilder.append("    const bool tries_ok = true;\n");
         } else {
-
-            triesBuilder.append("    static const u1 tries[] = {");
-            for (int i = 0; i < tries.length; i++) {
-                if (i % 10 == 0) {//每行10个元素
-                    triesBuilder.append("\n");
-                }
-                triesBuilder.append(String.format("0x%02x, ", tries[i] & 0xFF));
-
-            }
-            triesBuilder.append("\n    };\n");
+            final String triesIdentity = methodIdentity + "#tries";
+            final long triesTag = vmKeyConfig.methodTag64(triesIdentity);
+            final long triesSite = vmKeyConfig.siteCookie(triesIdentity);
+            final VmAead.Sealed sealedTries = VmAead.seal(vmKeyConfig, tries,
+                    VmAead.DOMAIN_TRIES, triesTag,
+                    vmKeyConfig.nonce("tries", triesIdentity), triesSite);
+            appendByteArray(triesBuilder, "tries_enc", sealedTries.ciphertext(), true);
+            appendByteArray(triesBuilder, "tries_nonce", sealedTries.nonce(), true);
+            appendByteArray(triesBuilder, "tries_tag", sealedTries.tag(), true);
+            triesBuilder.append(String.format("    u1 tries[%d];\n", tries.length));
+            triesBuilder.append(String.format(
+                    "    const bool tries_ok = vm_aead_open(tries, tries_enc, %d, " +
+                            "tries_nonce, tries_tag, 0x%08xu, 0x%016xULL, " +
+                            "0x%016xULL ^ method_integrity);\n",
+                    tries.length, VmAead.DOMAIN_TRIES, triesTag, triesSite));
         }
         writer.write(triesBuilder.toString());
 
@@ -246,15 +295,25 @@ public class JniCodeGenerator {
                         "    const vmCode code = {\n" +
                         "            .insns=insns,\n" +
                         "            .insnsSize=%d,\n" +
+                        "            .returnType='%c',\n" +
                         "            .regs=regs,\n" +
                         "            .reg_flags=reg_flags,\n" +
-                        "            .triesHandlers=tries\n" +
+                        "            .triesHandlers=tries,\n" +
+                        "            .flow=%s,\n" +
+                        "            .integrityDelta=method_integrity\n" +
                         "    };\n" +
                         "\n" +
-                        "    jvalue value = vmInterpret(env,\n" +
-                        "                                &code,\n" +
-                        "                                &dvmResolver);\n"
-                , dataLength / 2));
+                        "    jvalue value = {0};\n" +
+                        "    if (insns_ok && tries_ok) {\n" +
+                        "        value = vmInterpret(env, &code, &dvmResolver);\n" +
+                        "    }\n"
+                , dataLength / 2, returnType.charAt(0), useFlow ? "&flow" : "NULL"));
+        writer.write(String.format("    vm_secure_wipe(insns, %d * sizeof(u2));\n", insnWords));
+        writer.write(String.format("    vm_secure_wipe(regs, %d * sizeof(regptr_t));\n", registerCount));
+        writer.write(String.format("    vm_secure_wipe(reg_flags, %d * sizeof(u1));\n", registerCount));
+        if (tries.length > 0) {
+            writer.write(String.format("    vm_secure_wipe(tries, %d);\n", tries.length));
+        }
         //不使用栈需要释放内存
         if (!useStack) {
             writer.write("    free(regs);\n");
@@ -292,6 +351,7 @@ public class JniCodeGenerator {
                         "#include <malloc.h>\n" +
                         "#include <jni.h>\n" +
                         "#include \"vm.h\"\n" +
+                        "extern u8 nmmp_integrity_delta(void);\n" +
                         "#include \"%s\"\n" +
                         "\n" +
                         "#ifdef __cplusplus\n" +
@@ -305,7 +365,11 @@ public class JniCodeGenerator {
                         "#define SET_REGISTER_WIDE(_idx, _val)       (regs[(_idx)] =(s8) (_val));\n" +
                         "\n" +
                         "#define SET_REGISTER_DOUBLE(_idx, _val)     (*((double*) &regs[(_idx)]) = (_val));\n" +
-                        "\n" +
+                        "\n\n" +
+                        "__attribute__((noinline)) static void vm_secure_wipe(void *ptr, size_t size) {\n" +
+                        "    volatile u1 *p = (volatile u1 *) ptr;\n" +
+                        "    while (size-- != 0) *p++ = 0;\n" +
+                        "}\n" +
                         "\n"
                 , config.getResolverFile().getName()));
 
@@ -325,8 +389,9 @@ public class JniCodeGenerator {
         if (isRegisterNative) {
             codeWriter.write("    //注册\n");
 
-            final String funName = MyMethodUtil.getJniFunctionName(config.getRegisterNativesClassName(),
-                    config.getRegisterNativesMethodName(), Collections.singletonList("I"), "V");
+            final String funName = vmKeyConfig.nativeSymbol(methodIdentity(
+                    "L" + config.getRegisterNativesClassName() + ";",
+                    config.getRegisterNativesMethodName(), Collections.singletonList("I"), "V"));
             codeWriter.write(String.format(
                     "    jclass clazz = (*env)->FindClass(env, \"%s\");\n" +
                             "    static const JNINativeMethod nativeMethod = {\n" +
@@ -355,29 +420,40 @@ public class JniCodeGenerator {
             return;
         }
         //记录类名之下所有方法起始位置及数量用于生成注册代码
-        HashMap<String, Ranger> methodRanger = new HashMap<>();
+        LinkedHashMap<String, Ranger> methodRanger = new LinkedHashMap<>();
 
+        final long fnMask = vmKeyConfig.getProtectionContext().deriveLong(
+                "jni-pointer-mask-v2", config.getDexName());
         writer.write("\n" +
+                "#include <stdint.h>\n" +
                 "typedef struct{\n" +
                 "    u4 nameIdx;\n" +
                 "    u4 sigIdx;\n" +
                 "    void *fnPtr;\n" +
                 "} MyNativeMethod;\n");
+        writer.write(String.format("static const uintptr_t gFnMask = (uintptr_t) 0x%016xULL;\n", fnMask));
 
         int methodIdx = 0;
-        writer.write("static const MyNativeMethod gNativeMethods[] = {\n");
+        writer.write("static MyNativeMethod gNativeMethods[] = {\n");
         final References references = resolverCodeGenerator.getReferences();
-        for (String clazz : handledNativeMethods.keySet()) {
+        final ArrayList<String> classes = new ArrayList<>(handledNativeMethods.keySet());
+        Collections.sort(classes);
+        vmKeyConfig.getProtectionContext().shuffle(
+                classes, "jni-class-order-v2/" + config.getDexName());
+        for (String clazz : classes) {
 
             int startIdx = methodIdx;
-            Set<MyMethod> methods = handledNativeMethods.get(clazz);
+            final ArrayList<MyMethod> methods = new ArrayList<>(handledNativeMethods.get(clazz));
+            methods.sort(Comparator.comparing(MyMethod::identity));
+            vmKeyConfig.getProtectionContext().shuffle(methods,
+                    "jni-method-order-v2/" + config.getDexName() + "/" + clazz);
             for (MyMethod method : methods) {
                 int nameIdx = references.getStringItemIndex(method.name);
                 int sigIdx = references.getStringItemIndex(MyMethodUtil.getMethodSignature(method.parameterTypes, method.returnType));
+                String jniFunName = vmKeyConfig.nativeSymbol(method.identity());
                 writer.write(String.format(
                         "    {%d, %d, (void *) %s},\n",
-                        nameIdx, sigIdx,
-                        MyMethodUtil.getJniFunctionName(method.className, method.name, method.parameterTypes, method.returnType)
+                        nameIdx, sigIdx, jniFunName
                 ));
                 methodIdx++;
             }
@@ -408,12 +484,21 @@ public class JniCodeGenerator {
         writer.write("};\n\n");
 
         //当前dex下所有处理过的class对应的本地方法注册
-        final String funName = MyMethodUtil.getJniFunctionName(config.getRegisterNativesClassName(),
-                config.getRegisterNativesMethodName(), Collections.singletonList("I"), "V");
+        final String funName = vmKeyConfig.nativeSymbol(methodIdentity(
+                "L" + config.getRegisterNativesClassName() + ";",
+                config.getRegisterNativesMethodName(), Collections.singletonList("I"), "V"));
         writer.write(String.format(
                 "static void %s(JNIEnv *env, jclass jcls, jint dataIdx){\n" +
                         "#define MAX_METHOD 8\n" +
                         "    JNINativeMethod methodBuf[MAX_METHOD];\n" +
+                        "\n" +
+                        "    static int encoded = 0;\n" +
+                        "    if (!encoded) {\n" +
+                        "        for (u4 i = 0; i < (u4) (sizeof(gNativeMethods) / sizeof(gNativeMethods[0])); i++) {\n" +
+                        "            gNativeMethods[i].fnPtr = (void *) ((uintptr_t) gNativeMethods[i].fnPtr ^ gFnMask);\n" +
+                        "        }\n" +
+                        "        encoded = 1;\n" +
+                        "    }\n" +
                         "\n" +
                         "    JNINativeMethod *methods;\n" +
                         "    const NativeMethodData data = gNativeRegisterData[(u4) dataIdx];\n" +
@@ -434,7 +519,7 @@ public class JniCodeGenerator {
                         "        JNINativeMethod *method = methods + midx;\n" +
                         "        method->name = STRING_BY_ID(myNativeMethod.nameIdx);\n" +
                         "        method->signature = STRING_BY_ID(myNativeMethod.sigIdx);\n" +
-                        "        method->fnPtr = myNativeMethod.fnPtr;\n" +
+                        "        method->fnPtr = (void *) ((uintptr_t) myNativeMethod.fnPtr ^ gFnMask);\n" +
                         "    }\n" +
                         "\n" +
                         "    (*env)->RegisterNatives(env, clazz, methods, data.count);\n" +
@@ -446,6 +531,64 @@ public class JniCodeGenerator {
                         "}\n\n"
                 , funName)
         );
+    }
+
+    private static @NotNull String methodIdentity(@NotNull String classType,
+                                                   @NotNull String methodName,
+                                                   @NotNull List<? extends CharSequence> parameterTypes,
+                                                   @NotNull String returnType) {
+        return classType + "->" + methodName
+                + MyMethodUtil.getMethodSignature(parameterTypes, returnType);
+    }
+
+    private static void writeByteArray(@NotNull Writer writer,
+                                       @NotNull String name,
+                                       byte @NotNull [] data,
+                                       boolean constant) throws IOException {
+        final StringBuilder output = new StringBuilder();
+        appendByteArray(output, name, data, constant);
+        writer.write(output.toString());
+    }
+
+    private static void appendByteArray(@NotNull StringBuilder output,
+                                        @NotNull String name,
+                                        byte @NotNull [] data,
+                                        boolean constant) {
+        output.append("    static ");
+        if (constant) output.append("const ");
+        output.append("u1 ").append(name).append('[').append(data.length).append("] = {");
+        for (int i = 0; i < data.length; i++) {
+            if ((i & 15) == 0) output.append("\n        ");
+            output.append(String.format("0x%02x, ", data[i] & 0xff));
+        }
+        output.append("\n    };\n");
+    }
+
+    private static @NotNull String byteInitializer(byte @NotNull [] data) {
+        final StringBuilder output = new StringBuilder("{");
+        for (int i = 0; i < data.length; i++) {
+            if (i != 0) output.append(", ");
+            output.append(String.format("0x%02x", data[i] & 0xff));
+        }
+        return output.append('}').toString();
+    }
+
+    private static final class FlowBlob {
+        private final int startWords;
+        private final int sizeWords;
+        private final long contextTag;
+        private final long siteMaterial;
+        private final VmAead.Sealed sealed;
+
+        private FlowBlob(int startWords, int sizeWords,
+                         long contextTag, long siteMaterial,
+                         VmAead.Sealed sealed) {
+            this.startWords = startWords;
+            this.sizeWords = sizeWords;
+            this.contextTag = contextTag;
+            this.siteMaterial = siteMaterial;
+            this.sealed = sealed;
+        }
     }
 
     private static class MyMethod {
@@ -460,6 +603,10 @@ public class JniCodeGenerator {
             this.name = name;
             this.parameterTypes = parameterTypes;
             this.returnType = returnType;
+        }
+
+        private @NotNull String identity() {
+            return methodIdentity("L" + className + ";", name, parameterTypes, returnType);
         }
 
         @Override

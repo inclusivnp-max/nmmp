@@ -7,4 +7,8 @@ public interface ClassAndMethodFilter {
     boolean acceptClass(ClassDef classDef);
 
     boolean acceptMethod(Method method);
+
+    default String getFlowLockAnnotationType() {
+        return null;
+    }
 }

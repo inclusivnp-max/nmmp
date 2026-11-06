@@ -3,8 +3,42 @@ package data
 import com.mcal.preferences.PreferencesManager
 import com.nmmedit.apkprotect.data.Prefs
 import com.nmmedit.apkprotect.data.Storage
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermission
 
 object AppPrefs : PreferencesManager(Storage.binDir, "nmmp_preferences.json") {
+    private const val KEYSTORE_PASSWORD = "keystore_pass"
+    private const val KEY_PASSWORD = "keystore_alias_pass"
+
+    @Volatile
+    private var sessionKeystorePassword = ""
+
+    @Volatile
+    private var sessionKeyPassword = ""
+
+    init {
+        removePersistedSigningSecrets()
+    }
+
+    private fun removePersistedSigningSecrets() {
+        Prefs.remove(KEYSTORE_PASSWORD)
+        Prefs.remove(KEY_PASSWORD)
+        try {
+            val preferences = Storage.binDir.resolve("nmmp_preferences.json").toPath()
+            if (Files.exists(preferences)) {
+                Files.setPosixFilePermissions(
+                    preferences,
+                    setOf(
+                        PosixFilePermission.OWNER_READ,
+                        PosixFilePermission.OWNER_WRITE,
+                    ),
+                )
+            }
+        } catch (_: UnsupportedOperationException) {
+            // Non-POSIX platforms keep their native ACLs.
+        }
+    }
+
     /**
      * ApkSigner
      */
@@ -20,12 +54,14 @@ object AppPrefs : PreferencesManager(Storage.binDir, "nmmp_preferences.json") {
 
     @JvmStatic
     fun keystorePass(): String {
-        return Prefs.getString("keystore_pass", "")
+        return sessionKeystorePassword
     }
 
     @JvmStatic
+    @Synchronized
     fun setKeystorePass(name: String) {
-        Prefs.putString("keystore_pass", name)
+        sessionKeystorePassword = name
+        Prefs.remove(KEYSTORE_PASSWORD)
     }
 
     @JvmStatic
@@ -40,12 +76,14 @@ object AppPrefs : PreferencesManager(Storage.binDir, "nmmp_preferences.json") {
 
     @JvmStatic
     fun keystoreAliasPass(): String {
-        return Prefs.getString("keystore_alias_pass", "")
+        return sessionKeyPassword
     }
 
     @JvmStatic
+    @Synchronized
     fun setKeystoreAliasPass(name: String) {
-        Prefs.putString("keystore_alias_pass", name)
+        sessionKeyPassword = name
+        Prefs.remove(KEY_PASSWORD)
     }
 
     /**

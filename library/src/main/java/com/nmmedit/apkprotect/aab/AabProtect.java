@@ -11,6 +11,7 @@ import com.nmmedit.apkprotect.dex2c.Dex2c;
 import com.nmmedit.apkprotect.dex2c.GlobalDexConfig;
 import com.nmmedit.apkprotect.dex2c.converter.ClassAnalyzer;
 import com.nmmedit.apkprotect.dex2c.converter.instructionrewriter.InstructionRewriter;
+import com.nmmedit.apkprotect.dex2c.converter.instructionrewriter.RandomInstructionRewriter;
 import com.nmmedit.apkprotect.dex2c.filters.ClassAndMethodFilter;
 import com.nmmedit.apkprotect.log.VmpLogger;
 import com.nmmedit.apkprotect.util.ApkUtils;
@@ -183,7 +184,11 @@ public class AabProtect {
 
             final File newMainDex = ApkProtect.internNativeUtilClassDef(
                     mainDex,
-                    globalConfig, Prefs.getNmmpName());
+                    globalConfig,
+                    Prefs.getNmmpName(),
+                    instructionRewriter instanceof RandomInstructionRewriter
+                            ? ((RandomInstructionRewriter) instructionRewriter).getSeed()
+                            : 0x535452494e47564dL);
             //替换为新的dex
             outDexFiles.set(0, newMainDex);
 

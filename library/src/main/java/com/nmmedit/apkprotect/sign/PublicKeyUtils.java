@@ -12,7 +12,9 @@ public class PublicKeyUtils {
     public static byte @Nullable [] getPublicKey(String keyStorePath, String alias, String password) {
         try {
             final KeyStore ks = KeyStore.getInstance(KeyStore.getDefaultType());
-            ks.load(new FileInputStream(keyStorePath), password.toCharArray());
+            try (FileInputStream input = new FileInputStream(keyStorePath)) {
+                ks.load(input, password.toCharArray());
+            }
             if (alias == null || alias.isEmpty()) {
                 final Enumeration<String> aliases = ks.aliases();
                 if (aliases == null) {
@@ -36,14 +38,16 @@ public class PublicKeyUtils {
     }
 
     /**
-     * 32-bit fold of the signer certificate DER (FNV-1a 64 -> hi^lo). Must match
-     * the native vm_sig_delta computation over the same cert bytes read from the
-     * APK v2 signing block. Baked into the VM at protect time.
+     * 64-bit FNV-1a fingerprint of the signer certificate DER. The emitter
+     * uses it to derive the valid per-build stream material; the fingerprint
+     * itself is not emitted as a native comparison constant.
      */
     public static long getCertificateFold(String keyStorePath, String alias, String password) {
         try {
             final KeyStore ks = KeyStore.getInstance(KeyStore.getDefaultType());
-            ks.load(new FileInputStream(keyStorePath), password.toCharArray());
+            try (FileInputStream input = new FileInputStream(keyStorePath)) {
+                ks.load(input, password.toCharArray());
+            }
             if (alias == null || alias.isEmpty()) {
                 final Enumeration<String> aliases = ks.aliases();
                 if (aliases != null && aliases.hasMoreElements()) {
@@ -56,12 +60,12 @@ public class PublicKeyUtils {
                         keyStorePath + " entry \"" + alias + "\" does not contain certificates");
             }
             final byte[] der = chain[0].getEncoded();
-            long h = 0xcbf29ce484222325L;
+            long fold = 0;
             for (byte b : der) {
-                h ^= (b & 0xffL);
-                h *= 0x100000001b3L;
+                fold = Long.rotateLeft(fold, 7);
+                fold ^= (b & 0xffL);
             }
-            return ((h >>> 32) ^ (h & 0xffffffffL)) & 0xffffffffL;
+            return fold;
         } catch (Exception e) {
             throw new RuntimeException(e);
         }

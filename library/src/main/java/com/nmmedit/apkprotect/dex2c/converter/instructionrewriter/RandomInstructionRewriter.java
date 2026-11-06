@@ -2,14 +2,13 @@ package com.nmmedit.apkprotect.dex2c.converter.instructionrewriter;
 
 import com.android.tools.smali.dexlib2.Opcode;
 import com.android.tools.smali.dexlib2.Opcodes;
+import com.nmmedit.apkprotect.dex2c.converter.BuildProtectionContext;
 import org.jetbrains.annotations.NotNull;
 
-import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
 import java.util.List;
-import java.util.Random;
 
 /**
  * Shuffles the VM opcode numbering per build so the interpreter's
@@ -32,16 +31,34 @@ public class RandomInstructionRewriter extends InstructionRewriter {
     private final List<Opcode> opcodeList = new ArrayList<>(256);
     private final EnumMap<Opcode, Integer> opcodeMap = new EnumMap<>(Opcode.class);
     private final long seed;
+    private final BuildProtectionContext protectionContext;
 
     public RandomInstructionRewriter() {
-        this(new SecureRandom().nextLong());
+        this(BuildProtectionContext.random(), null);
     }
 
     public RandomInstructionRewriter(long seed) {
+        this(BuildProtectionContext.fromLong(seed), seed);
+    }
+
+    public RandomInstructionRewriter(byte @NotNull [] seed) {
+        this(BuildProtectionContext.fromSeed(seed), null);
+    }
+
+    public RandomInstructionRewriter(@NotNull BuildProtectionContext protectionContext) {
+        this(protectionContext, null);
+    }
+
+    private RandomInstructionRewriter(@NotNull BuildProtectionContext protectionContext,
+                                      Long compatibilitySeed) {
         //虚拟机使用39版本的opcode,所以这里需要使用同样版本
         super(Opcodes.forDexVersion(39));
-        this.seed = seed;
-        final Random random = new Random(seed);
+        this.protectionContext = protectionContext;
+        this.seed = compatibilitySeed != null
+                ? compatibilitySeed
+                : protectionContext.deriveLong("legacy-build-seed", "opcode-v2");
+        final BuildProtectionContext.DeterministicStream random =
+                protectionContext.stream("opcode-permutation-v2");
 
         // Build the default layout, and collect the shuffle pool together with
         // the slots those opcodes may occupy (every real, non-NOP opcode).
@@ -61,6 +78,7 @@ public class RandomInstructionRewriter extends InstructionRewriter {
             final int j = random.nextInt(i + 1);
             Collections.swap(pool, i, j);
         }
+        random.destroy();
 
         // Place the shuffled opcodes back onto the same set of real slots.
         for (int k = 0; k < targetSlots.size(); k++) {
@@ -79,6 +97,10 @@ public class RandomInstructionRewriter extends InstructionRewriter {
      */
     public long getSeed() {
         return seed;
+    }
+
+    public @NotNull BuildProtectionContext getProtectionContext() {
+        return protectionContext;
     }
 
     @Override

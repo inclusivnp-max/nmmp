@@ -14,15 +14,20 @@ import com.mcal.apkparser.zip.ZipOutputStream;
 import com.nmmedit.apkprotect.data.Prefs;
 import com.nmmedit.apkprotect.dex2c.Dex2c;
 import com.nmmedit.apkprotect.dex2c.DexConfig;
+import com.nmmedit.apkprotect.dex2c.DexStringEncryptor;
 import com.nmmedit.apkprotect.dex2c.GlobalDexConfig;
+import com.nmmedit.apkprotect.dex2c.StringDecryptorClassDef;
 import com.nmmedit.apkprotect.dex2c.converter.ClassAnalyzer;
 import com.nmmedit.apkprotect.dex2c.converter.instructionrewriter.InstructionRewriter;
+import com.nmmedit.apkprotect.dex2c.converter.instructionrewriter.RandomInstructionRewriter;
 import com.nmmedit.apkprotect.dex2c.converter.structs.RegisterNativesUtilClassDef;
 import com.nmmedit.apkprotect.dex2c.filters.ClassAndMethodFilter;
 import com.nmmedit.apkprotect.log.VmpLogger;
 import com.nmmedit.apkprotect.util.ApkUtils;
 import com.nmmedit.apkprotect.util.CmakeUtils;
+import com.nmmedit.apkprotect.util.ElfAntiObjdumpPatcher;
 import com.nmmedit.apkprotect.util.FileHelper;
+import com.nmmedit.apkprotect.util.ManifestConfuser;
 import com.nmmedit.apkprotect.util.ZipHelper;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
@@ -32,6 +37,10 @@ import java.io.BufferedInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -143,7 +152,7 @@ public class ApkProtect {
         mainDexClassList.add(tmpType);
         for (DexConfig config : globalConfig.getConfigs()) {
             DexBackedDexFile dexFile = DexBackedDexFile.fromInputStream(
-                    Opcodes.getDefault(),
+                    null,
                     new BufferedInputStream(new FileInputStream(config.getShellDexFile())));
             final Set<? extends DexBackedClassDef> classes = dexFile.getClasses();
             ClassDef classDef;
@@ -189,29 +198,30 @@ public class ApkProtect {
     ) throws IOException {
 
         final ArrayList<File> dexFiles = new ArrayList<>();
-
-        DexPool lastDexPool = new DexPool(Opcodes.getDefault());
-
         final List<DexConfig> configs = globalConfig.getConfigs();
+        final Opcodes outputOpcodes = outputOpcodes(configs);
+        DexPool lastDexPool = new DexPool(outputOpcodes);
         //第一个dex为main dex
         //提前处理主dex里的类
         for (DexConfig config : configs) {
 
             DexBackedDexFile dexNativeFile = DexBackedDexFile.fromInputStream(
-                    Opcodes.getDefault(),
+                    null,
                     new BufferedInputStream(new FileInputStream(config.getShellDexFile())));
 
             for (ClassDef classDef : dexNativeFile.getClasses()) {
                 if (mainClassSet.contains(classDef.getType())) {
                     //可能保留的类太多,导超出致dex引用,又没再接收返回的dex而导致丢失class
-                    Dex2c.injectCallRegisterNativeInsns(config, lastDexPool, mainClassSet, maxPoolSize);
+                    Dex2c.injectCallRegisterNativeInsns(
+                            config, lastDexPool, mainClassSet, maxPoolSize, outputOpcodes);
                 }
             }
         }
 
         for (int i = 0; i < configs.size(); i++) {
             DexConfig config = configs.get(i);
-            final List<DexPool> retPools = Dex2c.injectCallRegisterNativeInsns(config, lastDexPool, mainClassSet, maxPoolSize);
+            final List<DexPool> retPools = Dex2c.injectCallRegisterNativeInsns(
+                    config, lastDexPool, mainClassSet, maxPoolSize, outputOpcodes);
             if (retPools.isEmpty()) {
                 final VmpLogger logger = vmpLogger;
                 if (logger != null) {
@@ -239,11 +249,50 @@ public class ApkProtect {
                 dexFiles.add(file);
 
 
-                lastDexPool = new DexPool(Opcodes.getDefault());
+                lastDexPool = new DexPool(outputOpcodes);
             }
         }
 
         return dexFiles;
+    }
+
+    private static @NotNull Opcodes outputOpcodes(@NotNull List<DexConfig> configs)
+            throws IOException {
+        int highestApi = Opcodes.getDefault().api;
+        for (DexConfig config : configs) {
+            final DexBackedDexFile dexFile = DexBackedDexFile.fromInputStream(
+                    null,
+                    new BufferedInputStream(new FileInputStream(config.getShellDexFile())));
+            highestApi = Math.max(highestApi, dexFile.getOpcodes().api);
+        }
+        return Opcodes.forApi(highestApi);
+    }
+
+    private static @NotNull byte[] hardenPackagedNativeLibrary(@NotNull ZipFile zipFile,
+                                                                @NotNull ZipEntry entry,
+                                                                @NotNull File workDir)
+            throws IOException {
+        final Path hardeningDir = new File(workDir, "input-native-hardening").toPath();
+        Files.createDirectories(hardeningDir);
+        final Path temporary = Files.createTempFile(hardeningDir, "nmmp-lib-", ".so");
+        try {
+            try (InputStream input = zipFile.getInputStream(entry)) {
+                Files.copy(input, temporary, StandardCopyOption.REPLACE_EXISTING);
+            }
+            final ElfAntiObjdumpPatcher.Result result =
+                    ElfAntiObjdumpPatcher.patch(temporary.toFile());
+            final String message = String.format(
+                    "ELF anti-objdump (packaged): %s, sections preserved %d, executable flags cleared %d",
+                    entry.getName(), result.originalSectionCount(), result.modifiedSectionCount());
+            if (vmpLogger != null) {
+                vmpLogger.info(message);
+            } else {
+                System.out.println(message);
+            }
+            return Files.readAllBytes(temporary);
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
     }
 
     /**
@@ -264,13 +313,21 @@ public class ApkProtect {
     public static @NotNull File internNativeUtilClassDef(@NotNull File mainDex,
                                                          @NotNull GlobalDexConfig globalConfig,
                                                          @NotNull String libName) throws IOException {
+        return internNativeUtilClassDef(
+                mainDex, globalConfig, libName, 0x535452494e47564dL);
+    }
+
+    public static @NotNull File internNativeUtilClassDef(@NotNull File mainDex,
+                                                         @NotNull GlobalDexConfig globalConfig,
+                                                         @NotNull String libName,
+                                                         long stringSeed) throws IOException {
 
 
-        DexFile mainDexFile = DexBackedDexFile.fromInputStream(
-                Opcodes.getDefault(),
+        DexBackedDexFile mainDexFile = DexBackedDexFile.fromInputStream(
+                null,
                 new BufferedInputStream(new FileInputStream(mainDex)));
 
-        DexPool newDex = new DexPool(Opcodes.getDefault());
+        DexPool newDex = new DexPool(mainDexFile.getOpcodes());
 
 
         copyDex(mainDexFile, newDex);
@@ -281,9 +338,16 @@ public class ApkProtect {
         }
 
 
-        newDex.internClass(
-                new RegisterNativesUtilClassDef("L" + globalConfig.getConfigs().get(0).getRegisterNativesClassName() + ";",
-                        nativeMethodNames, libName));
+        final String registerClassName = globalConfig.getConfigs().get(0).getRegisterNativesClassName();
+        final DexStringEncryptor stringEncryptor = new DexStringEncryptor(
+                stringSeed, registerClassName);
+        newDex.internClass(stringEncryptor.rewriteClass(
+                new RegisterNativesUtilClassDef("L" + registerClassName + ";",
+                        nativeMethodNames, libName)));
+        for (ClassDef decoderClass : StringDecryptorClassDef.createAll(
+                registerClassName, stringSeed)) {
+            newDex.internClass(decoderClass);
+        }
 
         final File injectLoadLib = new File(mainDex.getParent(), "injectLoadLib");
         if (!injectLoadLib.exists()) injectLoadLib.mkdirs();
@@ -299,12 +363,26 @@ public class ApkProtect {
         return "L" + classDotName.replace('.', '/') + ";";
     }
 
+    public static void printProgress(int percent, String message) {
+        final int barWidth = 25;
+        int filled = (percent * barWidth) / 100;
+        StringBuilder bar = new StringBuilder();
+        for (int i = 0; i < barWidth; i++) {
+            if (i < filled) bar.append("=");
+            else if (i == filled) bar.append(">");
+            else bar.append(" ");
+        }
+        System.out.print(String.format("\r\033[K[%s] %3d%%  %s", bar.toString(), percent, message));
+        System.out.flush();
+    }
+
     public void run() throws IOException {
         final File apkFile = apkFolders.getInApk();
         final File zipExtractDir = apkFolders.getZipExtractTempDir();
 
         try {
             final VmpLogger logger = vmpLogger;
+            printProgress(10, "Reading input APK & AndroidManifest.xml...");
             byte[] manifestBytes = ZipHelper.getZipFileContent(apkFile, ANDROID_MANIFEST_XML);
             if (manifestBytes == null) {
                 if (logger != null) {
@@ -313,11 +391,24 @@ public class ApkProtect {
                     throw new RuntimeException("Not is apk");
                 }
             }
+            final long manifestSeed = instructionRewriter instanceof RandomInstructionRewriter
+                    ? ((RandomInstructionRewriter) instructionRewriter).getSeed()
+                    : 0x4d414e4946455354L;
+            final ManifestConfuser.Result manifestResult =
+                    ManifestConfuser.confuseDetailed(manifestBytes, manifestSeed);
+            manifestBytes = manifestResult.data();
+            System.out.printf(Locale.ROOT,
+                    "%nManifestConfuser: strings %d -> %d (+%d decoys, %d namespace aliases), "
+                            + "attributes shuffled %d across %d elements, line markers rewritten %d%n",
+                    manifestResult.originalStrings(), manifestResult.outputStrings(),
+                    manifestResult.decoyStrings(), manifestResult.namespaceAliases(),
+                    manifestResult.shuffledAttributes(), manifestResult.shuffledElements(),
+                    manifestResult.rewrittenLineNumbers());
 
-            //生成一些需要改变的c代码(随机opcode后的头文件及apk验证代码等)
+            printProgress(20, "Generating hardened C++ VM sources...");
             CmakeUtils.generateCSources(apkFolders.getDex2cSrcDir(), instructionRewriter);
 
-            //解压得到所有classesN.dex
+            printProgress(30, "Unpacking and analyzing DEX classes...");
             List<File> files = getClassesFiles(apkFile, zipExtractDir);
             if (files.isEmpty()) {
                 if (logger != null) {
@@ -338,53 +429,47 @@ public class ApkProtect {
                 //todo 加载android5的sdk,以保证能正确分析一些有问题的代码
             }
 
-            //
-
-
-            //先加载apk包含的所有dex文件,以便分析一些有问题的代码
             for (File file : files) {
                 classAnalyzer.loadDexFile(file);
             }
 
-
-            //globalConfig里面configs顺序和classesN.dex文件列表一样
+            printProgress(40, "Translating DEX bytecode to C++ & FlowLock splitting...");
             final GlobalDexConfig globalConfig = Dex2c.handleAllDex(files,
                     filter,
                     instructionRewriter,
                     classAnalyzer,
                     apkFolders.getCodeGeneratedDir());
 
-
-            //需要放在主dex里的类
             final Set<String> mainDexClassTypeSet = new HashSet<>();
-            //todo 可能需要通过外部配置来保留主dex需要的class
 
-
-            //在处理过的class的静态初始化方法里插入调用注册本地方法的指令
-            //static {
-            //    NativeUtils.initClass(0);
-            //}
-
+            printProgress(50, "Injecting JNI native registration callers...");
             final ArrayList<File> outDexFiles = injectInstructionAndWriteToFile(
                     globalConfig,
                     mainDexClassTypeSet,
                     60000,
                     apkFolders.getTempDexDir());
 
-
-            final List<String> abis = getAbis(apkFile);
-
-            final Map<String, Map<File, File>> nativeLibs = BuildNativeLib.generateNativeLibs(apkFolders.getOutRootDir(), abis);
-
             File mainDex = outDexFiles.get(0);
 
             final File newManDex = internNativeUtilClassDef(
                     mainDex,
                     globalConfig,
-                    Prefs.getNmmpName());
-            //替换为新的dex
+                    Prefs.getNmmpName(),
+                    manifestSeed);
             outDexFiles.set(0, newManDex);
 
+            // DEX hashes must cover the exact files that will be packaged.  The
+            // native util class is injected before compiling the VM so there is
+            // no circular dependency between DEX bytes and native libraries.
+            CmakeUtils.writeDexIntegrityConfig(
+                    apkFolders.getDex2cSrcDir(), outDexFiles);
+
+            final List<String> abis = getAbis(apkFile);
+
+            printProgress(60, "Compiling native C++ libraries for target ABIs...");
+            final Map<String, Map<File, File>> nativeLibs = BuildNativeLib.generateNativeLibs(apkFolders.getOutRootDir(), abis);
+
+            printProgress(80, "Repackaging protected DEX & native libs into APK...");
             final File outputApk = apkFolders.getOutputApk();
             if (outputApk.exists()) {
                 outputApk.delete();
@@ -405,10 +490,13 @@ public class ApkProtect {
                     }
 
                     //add native libs
+                    final Set<String> generatedNativeEntries = new HashSet<>();
                     for (Map.Entry<String, Map<File, File>> entry : nativeLibs.entrySet()) {
                         final String abi = entry.getKey();
                         for (File file : entry.getValue().values()) {
-                            zos.putNextEntry("lib/" + abi + "/" + file.getName());
+                            final String entryName = "lib/" + abi + "/" + file.getName();
+                            generatedNativeEntries.add(entryName);
+                            zos.putNextEntry(entryName);
                             zos.write(FileHelper.readBytes(file));
                             zos.closeEntry();
                         }
@@ -423,6 +511,16 @@ public class ApkProtect {
                         final ZipEntry ze = enumeration.nextElement();
                         final String entryName = ze.getName();
                         if (regex.matcher(entryName).matches()) {
+                            continue;
+                        }
+                        if (generatedNativeEntries.contains(entryName)) {
+                            continue;
+                        }
+                        if (entryName.matches("lib/[^/]+/[^/]+\\.so")) {
+                            zos.putNextEntry(entryName);
+                            zos.write(hardenPackagedNativeLibrary(
+                                    zipFile, ze, apkFolders.getOutRootDir()));
+                            zos.closeEntry();
                             continue;
                         }
                         zos.copyZipEntry(ze, zipFile);

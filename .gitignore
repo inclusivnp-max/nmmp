@@ -42,3 +42,17 @@ bin/
 .DS_Store
 
 /wix311
+
+# Local test artifacts and backups
+scripts/artifacts/
+*.bak
+*.bak.*
+*.save
+*.class
+
+# Secrets and local properties
+local.properties
+keystore.properties
+*.jks
+*.keystore
+

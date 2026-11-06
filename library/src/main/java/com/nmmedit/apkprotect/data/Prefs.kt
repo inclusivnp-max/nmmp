@@ -47,7 +47,7 @@ object Prefs : PreferencesManager(binDir, "nmmp_preferences.json") {
 
     @JvmStatic
     fun getVmName(): String {
-        return getString("vm_name", "wexprotectcore")
+        return getString("vm_name", "wexbridge")
     }
 
     @JvmStatic
@@ -57,7 +57,7 @@ object Prefs : PreferencesManager(binDir, "nmmp_preferences.json") {
 
     @JvmStatic
     fun getNmmpName(): String {
-        return getString("nmmp_name", "wexprotect")
+        return getString("nmmp_name", "wexbase")
     }
 
     @JvmStatic
@@ -79,7 +79,7 @@ object Prefs : PreferencesManager(binDir, "nmmp_preferences.json") {
     fun getRegisterNativesClassName(): String {
         return getString(
             "register_natives_class_name",
-            "com/wex/protect/WexProtect"
+            "client/wex/internal/NativeBridge"
         )
     }
 
@@ -140,8 +140,8 @@ object Prefs : PreferencesManager(binDir, "nmmp_preferences.json") {
         return getString("strip", "/bin/llvm-strip")
     }
 
-    // 32-bit fold of the signing cert DER, baked into the VM so bytecode
-    // decryption is bound to the original signature. 0 == disabled.
+    // 64-bit fingerprint of the signing cert DER used by the emitter's key
+    // schedule. The raw fingerprint is not written into the VM. 0 == disabled.
     @JvmStatic
     fun getExpectedSigFold(): Long {
         return getString("expected_sig_fold", "0").toLongOrNull() ?: 0L

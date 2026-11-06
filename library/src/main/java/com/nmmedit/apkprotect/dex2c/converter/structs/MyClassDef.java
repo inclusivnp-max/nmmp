@@ -13,6 +13,7 @@ import java.util.AbstractCollection;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 
 public class MyClassDef extends BaseTypeReference implements ClassDef {
@@ -22,14 +23,23 @@ public class MyClassDef extends BaseTypeReference implements ClassDef {
     private final List<? extends Method> directMethods;
     @NotNull
     private final List<? extends Method> virtualMethods;
+    private final boolean stripKotlinMetadata;
 
 
     public MyClassDef(@NotNull ClassDef classDef,
                       @NotNull List<? extends Method> directMethods,
                       @NotNull List<? extends Method> virtualMethods) {
+        this(classDef, directMethods, virtualMethods, false);
+    }
+
+    public MyClassDef(@NotNull ClassDef classDef,
+                      @NotNull List<? extends Method> directMethods,
+                      @NotNull List<? extends Method> virtualMethods,
+                      boolean stripKotlinMetadata) {
         this.classDef = classDef;
         this.directMethods = directMethods;
         this.virtualMethods = virtualMethods;
+        this.stripKotlinMetadata = stripKotlinMetadata;
     }
 
     @NotNull
@@ -64,7 +74,10 @@ public class MyClassDef extends BaseTypeReference implements ClassDef {
     @NotNull
     @Override
     public Set<? extends Annotation> getAnnotations() {
-        return classDef.getAnnotations();
+        if (!stripKotlinMetadata) return classDef.getAnnotations();
+        return classDef.getAnnotations().stream()
+                .filter(annotation -> !"Lkotlin/Metadata;".equals(annotation.getType()))
+                .collect(Collectors.toSet());
     }
 
     @NotNull

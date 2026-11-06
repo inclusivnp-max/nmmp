@@ -3,7 +3,9 @@ package task
 import com.nmmedit.apkprotect.log.VmpLogger
 import com.nmmedit.apkprotect.util.FileHelper.copyStream
 import com.nmmedit.apkprotect.util.FileUtils
-import java.io.*
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Paths
 
@@ -37,8 +39,7 @@ class ApkSignTask(
         }
 
         try {
-            execCmd(
-                listOf(
+            val command = listOf(
                     "java",
                     "-jar",
                     apksignerFile.absolutePath,
@@ -50,57 +51,23 @@ class ApkSignTask(
                     "--ks",
                     keystorePath,
                     "--ks-pass",
-                    "pass:$keystorePassword",
+                    "stdin",
                     "--ks-key-alias",
                     keystoreAlias,
                     "--key-pass",
-                    "pass:$keystoreAliasPassword",
-                ), this
+                    "stdin",
+                )
+            info(SecureSigningProcess.displayCommand(command))
+            val exitStatus = SecureSigningProcess.run(
+                command,
+                listOf(keystorePassword, keystoreAliasPassword),
+                ::info,
             )
-        } catch (e: IOException) {
-            e.printStackTrace()
-        }
-    }
-
-    @Throws(IOException::class)
-    private fun execCmd(cmds: List<String>, logger: VmpLogger?) {
-        if (logger != null) {
-            logger.info(cmds.toString())
-        } else {
-            println(cmds)
-        }
-        val builder = ProcessBuilder()
-            .command(cmds)
-
-        val process = builder.start()
-
-        printOutput(process.inputStream, logger)
-        printOutput(process.errorStream, logger)
-
-        try {
-            val exitStatus = process.waitFor()
             if (exitStatus != 0) {
-                if (logger != null) {
-                    logger.error(String.format("Cmd '%s' exec failed", cmds))
-                } else {
-                    throw IOException(String.format("Cmd '%s' exec failed", cmds))
-                }
+                throw IOException("apksigner failed with exit status $exitStatus")
             }
-        } catch (e: InterruptedException) {
-            e.printStackTrace()
-        }
-    }
-
-    @Throws(IOException::class)
-    private fun printOutput(inputStream: InputStream, logger: VmpLogger?) {
-        val reader = BufferedReader(InputStreamReader(inputStream))
-        var line: String?
-        while ((reader.readLine().also { line = it }) != null) {
-            if (logger != null) {
-                logger.info(line)
-            } else {
-                println(line)
-            }
+        } catch (e: IOException) {
+            error(e.message)
         }
     }
 

@@ -1,10 +1,7 @@
 package task
 
 import com.nmmedit.apkprotect.log.VmpLogger
-import java.io.BufferedReader
 import java.io.IOException
-import java.io.InputStream
-import java.io.InputStreamReader
 import java.nio.file.Files
 import java.nio.file.Paths
 
@@ -29,8 +26,7 @@ class AabSignTask(
 
 
         try {
-            execCmd(
-                listOf(
+            val command = listOf(
                     "jarsigner",
                     "-sigalg",
                     "SHA256withRSA",
@@ -38,60 +34,22 @@ class AabSignTask(
                     "SHA-256",
                     "-keystore",
                     keystorePath,
-                    "-storepass",
-                    keystorePassword,
-                    "-keypass",
-                    keystoreAliasPassword,
                     output,
                     keystoreAlias,
                     "-tsa",
                     "http://sha256timestamp.ws.symantec.com/sha256/timestamp"
-                ), this
+                )
+            info(SecureSigningProcess.displayCommand(command))
+            val exitStatus = SecureSigningProcess.run(
+                command,
+                listOf(keystorePassword, keystoreAliasPassword),
+                ::info,
             )
-        } catch (e: IOException) {
-            e.printStackTrace()
-        }
-    }
-
-    @Throws(IOException::class)
-    private fun execCmd(cmds: List<String>, logger: VmpLogger?) {
-        if (logger != null) {
-            logger.info(cmds.toString())
-        } else {
-            println(cmds)
-        }
-        val builder = ProcessBuilder()
-            .command(cmds)
-
-        val process = builder.start()
-
-        printOutput(process.inputStream, logger)
-        printOutput(process.errorStream, logger)
-
-        try {
-            val exitStatus = process.waitFor()
             if (exitStatus != 0) {
-                if (logger != null) {
-                    logger.error(String.format("Cmd '%s' exec failed", cmds))
-                } else {
-                    throw IOException(String.format("Cmd '%s' exec failed", cmds))
-                }
+                throw IOException("jarsigner failed with exit status $exitStatus")
             }
-        } catch (e: InterruptedException) {
-            e.printStackTrace()
-        }
-    }
-
-    @Throws(IOException::class)
-    private fun printOutput(inputStream: InputStream, logger: VmpLogger?) {
-        val reader = BufferedReader(InputStreamReader(inputStream))
-        var line: String?
-        while ((reader.readLine().also { line = it }) != null) {
-            if (logger != null) {
-                logger.info(line)
-            } else {
-                println(line)
-            }
+        } catch (e: IOException) {
+            error(e.message)
         }
     }
 

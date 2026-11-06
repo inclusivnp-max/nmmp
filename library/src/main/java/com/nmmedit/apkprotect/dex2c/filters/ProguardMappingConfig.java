@@ -173,6 +173,18 @@ public class ProguardMappingConfig implements ClassAndMethodFilter, MappingProce
     }
 
     @Override
+    public String getFlowLockAnnotationType() {
+        if (simpleRules == null) {
+            return null;
+        }
+        final String originalType = simpleRules.getFlowLockAnnotationType();
+        if (originalType == null) {
+            return null;
+        }
+        return oldTypeNewTypeMap.getOrDefault(originalType, originalType);
+    }
+
+    @Override
     public final void processClassMapping(String className, String newClassName) {
         newTypeOldTypeMap.put(classNameToType(newClassName), classNameToType(className));
         oldTypeNewTypeMap.put(classNameToType(className), classNameToType(newClassName));
